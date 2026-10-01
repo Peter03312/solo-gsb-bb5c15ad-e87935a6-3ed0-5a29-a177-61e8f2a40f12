@@ -47,6 +47,17 @@ class ProjectionIn(BaseModel):
     label: Optional[str] = Field(default=None, max_length=256, description="推演备注")
 
 
+class PackageIn(BaseModel):
+    """专题成果包封存请求：指定定版编号与一组已登记地层（至少两个、不重复）。
+
+    业务校验（空 / 不足两个 / 重复 / 定版不存在 / 地层未登记）在包服务层显式完成，
+    并分别返回明确错误码；校验失败不留任何半成品。
+    """
+
+    version: int = Field(ge=1, description="定版编号")
+    strata: List[str] = Field(description="已登记地层编号；至少两个且不重复（顺序不影响结果，自动排序去重）")
+
+
 class ProjectionBatchIn(BaseModel):
     """推演内的一批断言变更。须携带该推演当前修订号（自 0 起，批次成功后递增）；
     语义与正式批次一致：整批按应用后的最终关系核验，任一冲突则整批拒绝、推演状态不变。"""

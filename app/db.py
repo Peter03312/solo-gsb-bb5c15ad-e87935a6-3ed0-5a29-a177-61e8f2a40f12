@@ -140,6 +140,26 @@ CREATE TABLE IF NOT EXISTS revision_changes_sealed (
     source     TEXT NOT NULL,
     sealed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 专题成果包：把某一不可变定版中的一组已登记地层封存为可转交复核的成果包。
+-- 内容（pairs/evidence/transit_strata/content_hash）在封存时刻一次性写入，
+-- 之后永不修改、永不删除：正式断言撤回、后续修订、新定版均不影响包内容。
+-- 同一定版与同一地层集合（排序去重后取 strata_key）无论输入顺序只生成一份，
+-- 由 (version, strata_key) 唯一约束保证，重复请求幂等返回已封存包。
+CREATE TABLE IF NOT EXISTS thematic_packages (
+    id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    version        INTEGER NOT NULL REFERENCES snapshots(version),
+    revision       INTEGER NOT NULL,                       -- 定版对应的正式修订号（冗余留痕）
+    label          TEXT,
+    strata         JSONB NOT NULL,                         -- 排序去重后的入选地层编号
+    strata_key     TEXT NOT NULL,                          -- 入选集合的稳定指纹（集合身份，与顺序无关）
+    pairs          JSONB NOT NULL,                         -- 入选地层按编号排序的无序两两关系（冻结）
+    evidence       JSONB NOT NULL,                         -- 路径上按序去重的原始断言（定版冻结副本）
+    transit_strata JSONB NOT NULL,                         -- 路径途经但未入选的地层（仅随证据保留）
+    content_hash   TEXT NOT NULL,                          -- 包内容的 sha256 指纹，供转交复核校验
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (version, strata_key)
+);
 """
 
 _pool: "psycopg2.pool.ThreadedConnectionPool | None" = None

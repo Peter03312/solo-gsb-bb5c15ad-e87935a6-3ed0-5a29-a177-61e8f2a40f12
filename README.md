@@ -15,6 +15,10 @@
   发生矛盾时**整批拒绝**并返回冲突证据路径，原状态不变；全部通过则在同一事务内落库并**原子递增修订号**。
 - **路径选取**：多条证据路径时，取证据数最少者；并列时按证据编号序列字典序最小者。
 - **定版（快照）**：保存当前修订号下全部关系结论的不可变快照；后续撤回不影响旧版结论。
+- **专题成果包**：把某定版中的一组（≥2、不重复、已登记）地层封存为不可变、可转交
+  复核包：只含按编号排序的无序两两关系，结论与最优路径同该定版查询，确定结论携带
+  路径按序原始断言，途经未入选地层随证据保留但不扩展关系，未定不附路径；同一定版 +
+  同一地层集合（顺序无关）只封存一份，撤回 / 新修订 / 新定版均不改变包内容。
 - **修订变化追踪**：对每次成功的正式断言批次及推演并入产生的正式修订，记录提交前后
   关系结论或最优支撑路径发生变化的地层对；同一对按地层编号固定顺序只列一次；
   关系不变但最优路径改变也记录；变为未定时路径为空。记录与批次同事务原子写入，
@@ -74,6 +78,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/projections/{id}/relationship?a=L1&b=L3` | 查询推演视角下的关系与证据路径 |
 | POST | `/projections/{id}/merge` | 并入：净变更应用于最新正式状态并重新核验 |
 | DELETE | `/projections/{id}` | 放弃推演（仅 open 可放弃） |
+| POST | `/packages` | 封存专题成果包：把定版中的一组地层关系冻结为可转交复核包 `{version, strata[]}` |
+| GET | `/packages` / `/packages/{id}` | 成果包列表 / 成果包详情（冻结内容与内容指纹） |
 
 ### 批次请求格式
 
@@ -143,6 +149,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 409 | `MERGE_EVIDENCE_TAKEN` | 并入失败：推演新增证据编号已被正式历史占用 |
 | 409 | `MERGE_CONFLICT` | 并入核验发现关系冲突（附冲突证据路径），双方不变 |
 | 400 | `INVALID_CURSOR` | 变化追踪分页游标无效 |
+| 400 | `EMPTY_STRATA` | 成果包：地层集合为空 |
+| 400 | `NOT_ENOUGH_STRATA` | 成果包：少于两个地层编号 |
+| 400 | `DUPLICATE_STRATUM` | 成果包：地层编号重复 |
+| 404 | `PACKAGE_NOT_FOUND` | 成果包不存在 |
 
 ## 正式修订关系变化追踪
 
@@ -290,6 +300,105 @@ curl -X POST "$BASE/projections/1/merge"
 bash examples/projection_demo.sh
 ```
 
+## 专题成果包（定版地层关系封存转交）
+
+考古人员可把**某个定版**中的一组地层关系封存为可转交复核的专题成果包。成果包是
+**定版时刻的只读摘录**，独立于正式状态继续演化。
+
+**封存口径**
+
+- 请求给出定版编号 `version` 与至少两个、不重复的**已登记**地层编号 `strata`；
+- 包内只列所选地层**按编号排序**后的无序两两关系（每对取编号较小者为
+  `stratum_a`，`stratum_a < stratum_b`）；
+- 关系结论与最优证据路径与**该定版查询**（`GET /snapshots/{version}/relationship`）
+  严格一致：确定关系直接取自定版冻结结论，路径为该定版选取的最优证据序列
+  （证据数最少、并列按证据编号字典序最小）；
+- 每条确定结论的 `path_detail` 携带路径上**按顺序**的原始断言（证据编号、两端
+  地层、关系），原始断言取自**定版冻结的断言副本**（`snapshots.assertions`），
+  不读取在线断言表，因此其 `status` 恒为封存时的 `active`；
+- 路径**途经但未入选**的地层只随证据保留：包顶层给出 `transit_strata`，每步断言
+  用 `in_selection`（该步两端是否都在入选集合内）标注；不会因为途经而扩展出
+  额外的两两关系；
+- **未定关系**只返回 `relation=undetermined` 与中文标签，**不附** `evidence_path`
+  和 `path_detail`；
+- `evidence` 是包内所有路径引用到的去重原始断言清单（按证据编号排序），便于脱离
+  本服务转交复核；`content_hash` 是包内容（定版、修订、入选集合、pairs、evidence、
+  transit_strata）的 sha256 指纹，接收方可据此校验包未被篡改。
+
+**身份与不可变性**
+
+- 同一 `version` + **同一地层集合**无论输入顺序、是否重复输入，都只生成**一份**
+  成果包（按排序去重后的集合取指纹 `strata_key`，数据库唯一约束
+  `(version, strata_key)` 保证；并发封存也在行锁下串行）；
+- 首次封存返回 **HTTP 201**；同集合重复封存幂等返回**同一份**（相同 `id` 与
+  `content_hash`），HTTP **200**，响应带 `already_exists=true`；
+- 包内容在封存事务内一次性冻结，之后**永不修改、永不删除**：正式断言撤回、后续
+  修订、新定版都不会改变已有包（旧包仍展示定版当时的结论与当时生效断言）。
+
+**拒绝语义（校验失败明确拒绝、事务回滚，不留半成品）**
+
+| 情形 | HTTP | code |
+| --- | --- | --- |
+| `strata` 为空 | 400 | `EMPTY_STRATA` |
+| 少于两个地层 | 400 | `NOT_ENOUGH_STRATA` |
+| 地层编号重复 | 400 | `DUPLICATE_STRATUM` |
+| 含空编号 / 地层未登记 | 400 | `INVALID_STRATUM` |
+| 定版不存在 | 404 | `SNAPSHOT_NOT_FOUND` |
+| 缺少 `version`/`strata` 字段、类型不符 | 422 | FastAPI 请求体校验 |
+
+### 封存请求与响应
+
+```bash
+# 选 L1、L5、L6；L1 早于 L5 的证据链途经未入选的 L2、L3、L4
+curl -X POST "$BASE/packages" -H 'Content-Type: application/json' \
+  -d '{"version": 1, "strata": ["L1", "L5", "L6"]}'
+```
+
+```json
+{
+  "id": 1,
+  "version": 1,
+  "snapshot_revision": 1,
+  "label": "二期定版",
+  "strata": ["L1", "L5", "L6"],
+  "pairs": [
+    {
+      "stratum_a": "L1",
+      "stratum_b": "L5",
+      "relation": "earlier_than",
+      "relation_label": "早于",
+      "evidence_path": ["EV-001", "EV-002", "EV-003", "EV-004"],
+      "path_detail": [
+        {"evidence_id": "EV-001", "stratum_a": "L1", "stratum_b": "L2", "relation": "same_period", "status": "active", "in_selection": false},
+        {"evidence_id": "EV-002", "stratum_a": "L2", "stratum_b": "L3", "relation": "earlier_than", "status": "active", "in_selection": false},
+        {"evidence_id": "EV-003", "stratum_a": "L3", "stratum_b": "L4", "relation": "earlier_than", "status": "active", "in_selection": false},
+        {"evidence_id": "EV-004", "stratum_a": "L4", "stratum_b": "L5", "relation": "same_period", "status": "active", "in_selection": false}
+      ]
+    },
+    {"stratum_a": "L1", "stratum_b": "L6", "relation": "earlier_than", "relation_label": "早于", "...": "..."},
+    {"stratum_a": "L5", "stratum_b": "L6", "relation": "undetermined", "relation_label": "未定"}
+  ],
+  "evidence": [
+    {"evidence_id": "EV-001", "stratum_a": "L1", "stratum_b": "L2", "relation": "same_period", "status": "active"}
+  ],
+  "transit_strata": ["L2", "L3", "L4"],
+  "content_hash": "cfa6dd4e0236a56f9b4f18f1fbeeaed6f8913451d2329ac46f007f05d379fd15",
+  "created_at": "2026-10-01T01:24:31.192399+00:00",
+  "already_exists": false
+}
+```
+
+- 乱序等价：`{"version":1,"strata":["L6","L1","L5"]}` 与上例是**同一个集合**，
+  返回同一 `id`、同一 `content_hash`（HTTP 200，`already_exists=true`）；
+- 列表 `GET /packages` 只给摘要（不含 `pairs` 明细）；
+  详情 `GET /packages/{id}` 返回完整冻结内容，不存在返回 404 `PACKAGE_NOT_FOUND`。
+
+完整端到端演示（封存、乱序幂等、未定无路径、撤回 + 新定版后内容不变、各类拒绝）：
+
+```bash
+bash examples/packages_demo.sh
+```
+
 ## 调用示例
 
 端到端 curl 演示（覆盖登记、批次、推导查询、冲突拒绝、撤回、定版与旧版不可变）：
@@ -312,6 +421,13 @@ bash examples/projection_demo.sh
 bash examples/changes_demo.sh
 ```
 
+专题成果包封存演示（定版选层封存、路径途经未入选地层、乱序幂等一份、
+未定不附路径、撤回与新定版后不可变、空 / 重复 / 未登记 / 定版不存在明确拒绝）：
+
+```bash
+bash examples/packages_demo.sh
+```
+
 Python 客户端示例：
 
 ```bash
@@ -325,6 +441,7 @@ python3 examples/client_demo.py
 app/
   main.py         # FastAPI 路由与错误处理
   service.py      # 正式批次核验、关系查询、定版快照
+  packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
   projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询、并入核验
   changes.py      # 正式修订变化追踪：前后差异计算、游标分页、启动历史回填
   derivation.py   # 推导引擎：并查集等价类、DAG 校验、最优证据路径
@@ -334,6 +451,7 @@ examples/
   demo.sh           # curl 端到端示例（批次/查询/冲突/撤回/定版）
   projection_demo.sh # 推演端到端示例（沙盘批次、并入成功与三类失败、空净变更）
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）
+  packages_demo.sh # 专题成果包示例（封存/幂等/不可变/拒绝分支）
   client_demo.py    # Python 客户端示例
 Dockerfile
 docker-compose.yml

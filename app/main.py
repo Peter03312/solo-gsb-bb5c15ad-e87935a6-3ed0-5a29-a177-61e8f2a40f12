@@ -5,10 +5,10 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import changes, db, projections, service
+from . import changes, db, packages as packages_svc, projections, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
-from .models import BatchIn, ProjectionBatchIn, ProjectionIn, SnapshotIn, StratumIn
+from .models import BatchIn, PackageIn, ProjectionBatchIn, ProjectionIn, SnapshotIn, StratumIn
 
 
 @asynccontextmanager
@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
@@ -27,7 +27,8 @@ app = FastAPI(
         "支持关系查询（含支撑证据路径）与不可变定版快照；"
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
         "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
-        "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）。"
+        "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）；"
+        "支持把定版中的一组地层封存为不可变、可转交复核的专题成果包（/packages）。"
     ),
     lifespan=lifespan,
 )
@@ -176,6 +177,35 @@ def get_snapshot(version: int):
 def get_snapshot_relationship(version: int, a: str = Query(...), b: str = Query(...)):
     """查询历史版本结论；后续撤回不影响旧版。"""
     return service.query_snapshot_relationship(version, a, b)
+
+
+# ------------------------------------------------------------------ 专题成果包
+@app.post("/packages", tags=["packages"])
+def post_package(body: PackageIn):
+    """把某定版中的一组地层封存为不可变专题成果包（可转交复核）。
+
+    - 只含所选地层按编号排序的无序两两关系，结论与最优证据路径与该定版查询一致；
+    - 确定结论携带路径上按序的原始断言；路径途经未入选地层随证据保留
+      （`transit_strata` / 逐步 `in_selection`），不扩展额外关系；未定关系不附路径；
+    - 同一定版 + 同一地层集合（顺序无关）只生成一份：重复封存返回同一份
+      （`already_exists=true`，HTTP 200），首次封存 HTTP 201；
+    - 包内容封存即冻结，撤回、新修订、新定版均不改变。
+    """
+    payload, created = packages_svc.create_package(body)
+    payload["already_exists"] = not created
+    return JSONResponse(status_code=201 if created else 200, content=payload)
+
+
+@app.get("/packages", tags=["packages"])
+def list_packages():
+    """成果包列表（不含两两关系明细）。"""
+    return packages_svc.list_packages()
+
+
+@app.get("/packages/{package_id}", tags=["packages"])
+def get_package(package_id: int):
+    """成果包详情：冻结的两两关系、路径断言、途经未入选地层与内容指纹。"""
+    return packages_svc.get_package(package_id)
 
 
 # ------------------------------------------------------------------ 推演（证据修订沙盘）
