@@ -5,10 +5,17 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import changes, db, projections, service
+from . import changes, db, dossiers, projections, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
-from .models import BatchIn, ProjectionBatchIn, ProjectionIn, SnapshotIn, StratumIn
+from .models import (
+    BatchIn,
+    DossierIn,
+    ProjectionBatchIn,
+    ProjectionIn,
+    SnapshotIn,
+    StratumIn,
+)
 
 
 @asynccontextmanager
@@ -19,12 +26,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
         "批次携带修订号、按整批最终关系核验，矛盾整批拒绝；"
         "支持关系查询（含支撑证据路径）与不可变定版快照；"
+        "支持专题成果包（/dossiers）：把某定版内一组地层的两两关系与证据"
+        "封存为不可变、可转交复核的幂等成果；"
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
         "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
         "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）。"
@@ -176,6 +185,34 @@ def get_snapshot(version: int):
 def get_snapshot_relationship(version: int, a: str = Query(...), b: str = Query(...)):
     """查询历史版本结论；后续撤回不影响旧版。"""
     return service.query_snapshot_relationship(version, a, b)
+
+
+# ------------------------------------------------------------------ 专题成果包
+@app.post("/dossiers", status_code=201, tags=["dossiers"])
+def post_dossier(body: DossierIn):
+    """封存专题成果包：定版编号 + 至少两个不重复的已登记地层。
+
+    - 仅封存所选地层按编号排序的无序两两关系，结论与最优证据路径同该定版查询；
+    - 每条确定结论携带路径上按顺序的原始断言（取定版内嵌快照）；路径途经未入选
+      地层也随证据保留，但不扩展额外关系；未定关系不附路径与断言；
+    - 同一定版与同一地层集合无论输入顺序只生成一份包（幂等：重复请求返回既有包，
+      首次 201、复用 200）；包内容写入后不可变，撤回/修订/新定版均不改变它；
+    - 定版不存在 404；地层未登记 / 输入空或重复 / 不足两个，明确拒绝且不留半成品。
+    """
+    result, created = dossiers.create_dossier(body)
+    return JSONResponse(status_code=201 if created else 200, content={**result, "reused": not created})
+
+
+@app.get("/dossiers", tags=["dossiers"])
+def list_dossiers(version: Optional[int] = Query(default=None, ge=1, description="按定版编号过滤")):
+    """成果包列表（可按定版编号过滤）。"""
+    return dossiers.list_dossiers(version)
+
+
+@app.get("/dossiers/{dossier_id}", tags=["dossiers"])
+def get_dossier(dossier_id: int):
+    """成果包详情：封存内容（pairs）与内容指纹；包内容不可变。"""
+    return dossiers.get_dossier(dossier_id)
 
 
 # ------------------------------------------------------------------ 推演（证据修订沙盘）

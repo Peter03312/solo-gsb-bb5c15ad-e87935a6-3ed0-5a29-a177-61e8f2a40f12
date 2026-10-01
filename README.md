@@ -15,6 +15,11 @@
   发生矛盾时**整批拒绝**并返回冲突证据路径，原状态不变；全部通过则在同一事务内落库并**原子递增修订号**。
 - **路径选取**：多条证据路径时，取证据数最少者；并列时按证据编号序列字典序最小者。
 - **定版（快照）**：保存当前修订号下全部关系结论的不可变快照；后续撤回不影响旧版结论。
+- **专题成果包（dossier）**：把某个定版内一组选定地层的无序两两关系封存为可转交
+  复核的不可变成果。结论与最优证据路径与该定版查询一致；每条确定结论携带路径上
+  按顺序的原始断言，路径途经的未入选地层随证据保留但不扩展额外关系；未定关系不附
+  支撑路径与断言。同一定版与同一地层集合（与输入顺序无关）只有一份、永不改变，
+  正式断言撤回、后续修订和新定版都不影响已生成的包。
 - **修订变化追踪**：对每次成功的正式断言批次及推演并入产生的正式修订，记录提交前后
   关系结论或最优支撑路径发生变化的地层对；同一对按地层编号固定顺序只列一次；
   关系不变但最优路径改变也记录；变为未定时路径为空。记录与批次同事务原子写入，
@@ -68,6 +73,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/snapshots` | 定版：保存不可变关系快照 `{label?}` |
 | GET | `/snapshots` / `/snapshots/{version}` | 版本列表 / 版本详情 |
 | GET | `/snapshots/{version}/relationship?a=L1&b=L3` | 查询历史版本结论 |
+| POST | `/dossiers` | 封存专题成果包：`{version, strata[]}`（同版同集合幂等，首次 201 / 复用 200） |
+| GET | `/dossiers` / `/dossiers/{id}` | 成果包列表（可按 `?version=` 过滤）/ 成果包详情（封存内容与内容指纹） |
 | POST | `/projections` | 创建推演（固定当前修订号、地层与生效断言） `{label?}` |
 | GET | `/projections` / `/projections/{id}` | 推演列表 / 推演详情（含净变更） |
 | POST | `/projections/{id}/batches` | 推演内提交批次（携带推演修订号，语义同正式批次） |
@@ -137,6 +144,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 409 | `CONFLICT` | 整批核验发现组内早于 / 早于闭环（附冲突证据路径） |
 | 409 | `STRATUM_EXISTS` | 地层重复登记 |
 | 404 | `SNAPSHOT_NOT_FOUND` | 版本不存在 |
+| 404 | `DOSSIER_NOT_FOUND` | 专题成果包不存在 |
+| 400 | `EMPTY_SELECTION` | 成果包地层集合为空（空列表或空串） |
+| 400 | `SELECTION_TOO_SMALL` | 成果包入选地层不足两个不重复值 |
+| 400 | `DUPLICATE_STRATUM` | 成果包请求中地层编号重复 |
 | 404 | `PROJECTION_NOT_FOUND` | 推演不存在 |
 | 409 | `PROJECTION_CLOSED` | 推演已关闭（merged/discarded），不可再操作 |
 | 409 | `MERGE_TARGET_RETRACTED` | 并入失败：撤回目标证据已在最新正式状态被撤回 |
@@ -221,6 +232,93 @@ curl "$BASE/revision-changes?limit=100&cursor=eyJiIjo1LCJyIjoxLCJzIjozLCJ2IjoxfQ
 
 # 完整端到端示例（含失败批次 / 推演并入 / 路径变化 / 分页上界）
 bash examples/changes_demo.sh
+```
+
+## 专题成果包（可转交复核的定版封存）
+
+考古人员可把**某个定版**中的**一组地层关系**封存成专题成果包，转交他人复核。
+成果包是自包含、不可变的：接收方无需访问后续数据库状态，仅凭包内内容即可复核
+每一条结论的证据链。
+
+**封存口径**
+
+- 请求给 `version`（定版编号）与 `strata`（至少 2 个不重复的已登记地层编号）；
+- 包内只列所选地层按编号排序的 **C(n,2) 个无序地层对**，不扩展任何额外关系；
+- 每对的 `relation` 与 `evidence_path` 与该定版查询
+  （`GET /snapshots/{version}/relationship`）逐条一致，路径选取沿用
+  “证据数最少、并列按证据编号序列字典序最小”的规则；
+- 每条确定结论（同一期 / 早于 / 晚于）携带 `assertions`：路径上**按顺序**的原始
+  断言（证据编号、两端地层、关系），取自定版内嵌断言快照；
+- 最优路径**途经未入选地层**时，该地层随证据原样保留在路径与断言中
+  （例：入选 L1、L3，路径 `EV-001(L1~L2) → EV-002(L2<L3)` 中的 L2 未入选，
+  仍随证据保留），但不会因此新增任何地层对；
+- **未定关系不附支撑路径和断言**：`evidence_path` 与 `assertions` 均为 `[]`。
+
+**幂等与不可变**
+
+- 地层集合与输入顺序无关：服务端排序后存储，`(version, strata)` 唯一；
+  同一集合乱序或重复提交都返回**同一份包**——首次 `201`（`reused: false`），
+  之后 `200`（`reused: true`），并发首次请求也只会生成一份；
+- 包内容写入后永不修改、永不删除；**正式断言撤回、后续修订、新定版**都不改变
+  已生成的包（结论冻结在该定版视角）；
+- 每份包附 `content_hash`：包体（去掉 `id`/时间戳等元信息后的封存内容）规范化
+  JSON 的 sha256，转交后可复算校验包内容未被篡改。
+
+**明确拒绝（不留半成品）**：定版不存在（404）、地层未登记（400）、输入为空或
+全空串（400 `EMPTY_SELECTION`）、不足两个（400 `SELECTION_TOO_SMALL`）、地层
+重复（400 `DUPLICATE_STRATUM`）。所有校验与写入在同一事务内完成，拒绝时整体
+回滚。
+
+### 请求与响应
+
+```bash
+curl -X POST "$BASE/dossiers" -H 'Content-Type: application/json' \
+  -d '{"version": 1, "strata": ["L1", "L3", "L4"]}'
+# 乱序重发同样集合 -> 200，id 与内容完全相同
+curl -X POST "$BASE/dossiers" -H 'Content-Type: application/json' \
+  -d '{"version": 1, "strata": ["L4", "L1", "L3"]}'
+```
+
+```json
+{
+  "id": 1,
+  "version": 1,
+  "snapshot_revision": 1,
+  "strata": ["L1", "L3", "L4"],
+  "pairs": [
+    {
+      "stratum_a": "L1",
+      "stratum_b": "L3",
+      "relation": "earlier_than",
+      "relation_label": "早于",
+      "evidence_path": ["EV-001", "EV-002"],
+      "assertions": [
+        {"evidence_id": "EV-001", "stratum_a": "L1", "stratum_b": "L2", "relation": "same_period"},
+        {"evidence_id": "EV-002", "stratum_a": "L2", "stratum_b": "L3", "relation": "earlier_than"}
+      ]
+    },
+    {"stratum_a": "L1", "stratum_b": "L4", "relation": "earlier_than", "...": "..."},
+    {"stratum_a": "L3", "stratum_b": "L4", "relation": "earlier_than", "...": "..."}
+  ],
+  "content_hash": "614c8976…",
+  "created_at": "2026-10-01T00:49:40.982147+00:00",
+  "reused": false
+}
+```
+
+读取与列表：
+
+```bash
+curl "$BASE/dossiers"                # 全部成果包摘要
+curl "$BASE/dossiers?version=1"      # 只看某定版的成果包
+curl "$BASE/dossiers/1"              # 完整封存内容（含 pairs 与 content_hash）
+```
+
+完整端到端示例（封存、与定版查询一致、途经未入选地层、未定不附路径、乱序幂等、
+撤回与新定版不改变旧包、五类拒绝、列表与过滤）：
+
+```bash
+bash examples/dossiers_demo.sh
 ```
 
 ## 推演（证据修订沙盘）
@@ -312,6 +410,13 @@ bash examples/projection_demo.sh
 bash examples/changes_demo.sh
 ```
 
+专题成果包演示（定版封存、无序两两关系、最优路径与途经地层证据、与定版查询一致、
+未定不附路径、乱序幂等、撤回与新定版不改变旧包、各类拒绝不留半成品）：
+
+```bash
+bash examples/dossiers_demo.sh
+```
+
 Python 客户端示例：
 
 ```bash
@@ -325,6 +430,7 @@ python3 examples/client_demo.py
 app/
   main.py         # FastAPI 路由与错误处理
   service.py      # 正式批次核验、关系查询、定版快照
+  dossiers.py     # 专题成果包：定版地层集合封存、幂等去重、不可变读取
   projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询、并入核验
   changes.py      # 正式修订变化追踪：前后差异计算、游标分页、启动历史回填
   derivation.py   # 推导引擎：并查集等价类、DAG 校验、最优证据路径
@@ -332,6 +438,7 @@ app/
   models.py       # 请求模型
 examples/
   demo.sh           # curl 端到端示例（批次/查询/冲突/撤回/定版）
+  dossiers_demo.sh  # 专题成果包端到端示例（封存/幂等/不可变/拒绝场景）
   projection_demo.sh # 推演端到端示例（沙盘批次、并入成功与三类失败、空净变更）
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）
   client_demo.py    # Python 客户端示例

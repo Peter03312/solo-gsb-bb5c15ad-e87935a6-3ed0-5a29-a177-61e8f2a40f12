@@ -62,6 +62,21 @@ CREATE TABLE IF NOT EXISTS snapshot_conclusions (
     PRIMARY KEY (version, stratum_a, stratum_b)
 );
 
+-- 专题成果包：把某个定版内选定地层集合的无序两两关系封存为可转交复核的成果。
+-- 内容完全取自定版快照（snapshot_conclusions 与 snapshots.assertions 内嵌快照），
+-- 因此正式断言撤回、后续修订、新定版均不影响已生成的包。
+-- 同一定版 + 同一地层集合（集合与输入顺序无关，存排序后数组）只有一份：
+-- 唯一约束配合创建接口的 ON CONFLICT 实现幂等；body 一旦写入永不修改、永不删除。
+CREATE TABLE IF NOT EXISTS dossiers (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    version      INTEGER NOT NULL REFERENCES snapshots(version),
+    strata       JSONB NOT NULL,          -- 排序去重后的入选地层编号数组
+    body         JSONB NOT NULL,          -- 封存内容：pairs（结论 + 证据路径 + 原始断言）
+    content_hash CHAR(64) NOT NULL,       -- body 规范化 JSON 的 sha256，供转交复核校验
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (version, strata)
+);
+
 -- 推演（证据修订沙盘）：创建时固定正式修订号、已登记地层与生效断言快照，
 -- 不触碰正式状态；并入（merge）时才把相对基线的净变更原子应用到最新正式状态。
 CREATE TABLE IF NOT EXISTS projections (

@@ -72,7 +72,16 @@ def main() -> None:
         requests.get(f"{BASE}/snapshots/{version}/relationship", params={"a": "L1", "b": "L3"}),
     )
 
-    # 7. 正式修订关系变化追踪：游标分页整轮读取
+    # 7. 专题成果包：封存定版内一组地层的两两关系（路径途经未入选地层也随证据保留）
+    payload = {"version": version, "strata": ["L3", "L1"]}  # 顺序无关
+    dossier = show("封存专题成果包（L1/L3）", requests.post(f"{BASE}/dossiers", json=payload))
+    did = dossier["id"]
+    again = show("乱序重发（幂等，复用同一份）", requests.post(f"{BASE}/dossiers", json=payload))
+    assert again["id"] == did and again["reused"] is True
+    show("成果包列表（按定版过滤）", requests.get(f"{BASE}/dossiers", params={"version": version}))
+    show("成果包详情（撤回后依旧不变）", requests.get(f"{BASE}/dossiers/{did}"))
+
+    # 8. 正式修订关系变化追踪：游标分页整轮读取
     print("\n== 正式修订关系变化追踪（游标分页） ==")
     cursor = None
     bound = None

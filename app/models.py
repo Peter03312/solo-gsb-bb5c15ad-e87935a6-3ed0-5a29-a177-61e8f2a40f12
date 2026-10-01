@@ -41,6 +41,18 @@ class SnapshotIn(BaseModel):
     label: Optional[str] = Field(default=None, max_length=256, description="版本备注")
 
 
+class DossierIn(BaseModel):
+    """专题成果包请求：定版编号 + 至少两个已登记、互不重复的地层编号。
+
+    集合语义：地层顺序无关，同一集合无论输入顺序只得到同一份成果包
+    （创建接口幂等，重复请求返回既有包）。空列表 / 含空串 / 含重复地层
+    由业务层明确拒绝，不产生半成品。
+    """
+
+    version: int = Field(ge=1, description="已存在的定版编号")
+    strata: List[str] = Field(description="入选地层编号（至少 2 个不重复值）")
+
+
 class ProjectionIn(BaseModel):
     """创建推演：固定当前正式修订号、已登记地层与生效断言快照。"""
 
